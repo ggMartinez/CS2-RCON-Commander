@@ -72,10 +72,13 @@ export default function App() {
   const [serverInfo, setServerInfo] = useState<any>(null);
   const [isFetchingStatus, setIsFetchingStatus] = useState(false);
   const [workshopMaps, setWorkshopMaps] = useState<any[]>([]);
+  const [serverMaps, setServerMaps] = useState<any[]>([]);
   const [rawWorkshopOutput, setRawWorkshopOutput] = useState<string>('');
   const [showRawWorkshop, setShowRawWorkshop] = useState(false);
   const [isFetchingMaps, setIsFetchingMaps] = useState(false);
   const [mapSortOrder, setMapSortOrder] = useState<'name' | 'source'>('name');
+  const [configEdited, setConfigEdited] = useState(false);
+  const [hasAutoConnectAttempted, setHasAutoConnectAttempted] = useState(false);
   const [theme, setTheme] = useState(THEMES[0]);
 
   useEffect(() => {
@@ -169,11 +172,15 @@ export default function App() {
       fetchStatus();
       const interval = setInterval(fetchStatus, 3000);
       return () => clearInterval(interval);
-    } else if (config.host && config.password && !isConnecting) {
-      // Auto-reconnect on mount or when disconnected but credentials exist
+    }
+  }, [isConnected]);
+
+  useEffect(() => {
+    if (!isConnected && !isConnecting && !hasAutoConnectAttempted && !configEdited && config.host && config.password) {
+      setHasAutoConnectAttempted(true);
       testConnection();
     }
-  }, [isConnected, config.host, config.password]);
+  }, [isConnected, isConnecting, hasAutoConnectAttempted, configEdited, config.host, config.password]);
 
   useEffect(() => {
     consoleEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -303,7 +310,6 @@ export default function App() {
 
   const fetchWorkshopMaps = async () => {
     if (!isConnected) return;
-    setIsFetchingMaps(true);
     const sanitized = sanitizeConfig(config);
     try {
       const res = await fetch(`${window.location.origin}/api/rcon/workshop-maps`, {
@@ -318,9 +324,53 @@ export default function App() {
       if (data.success) {
         setWorkshopMaps(data.maps);
         setRawWorkshopOutput(data.raw || '');
+        addLog('response', `Workshop maps loaded (${data.maps.length || 0} entries)`);
+        console.debug('Workshop maps response:', data.raw || data.maps);
+      } else {
+        addLog('error', `Workshop maps failed: ${data.error || 'Unknown error'}`);
+        console.error('Failed to fetch workshop maps:', data.error);
       }
-    } catch (err) {
+    } catch (err: any) {
+      addLog('error', `Workshop maps fetch error: ${err.message}`);
       console.error("Failed to fetch workshop maps", err);
+    }
+  };
+
+  const fetchInstalledMaps = async () => {
+    if (!isConnected) return;
+    const sanitized = sanitizeConfig(config);
+    try {
+      const res = await fetch(`${window.location.origin}/api/rcon/installed-maps`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...sanitized,
+          password: btoa(unescape(encodeURIComponent(config.password)))
+        }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setServerMaps(data.maps);
+        addLog('response', `Installed maps loaded (${data.maps.length || 0} entries)`);
+        if (!data.maps || data.maps.length === 0) {
+          addLog('error', 'No installed maps were returned by the server');
+        }
+        console.debug('Installed maps response:', data);
+      } else {
+        addLog('error', `Installed maps failed: ${data.error || 'Unknown error'}`);
+        console.error('Failed to fetch installed maps:', data.error);
+      }
+    } catch (err: any) {
+      addLog('error', `Installed maps fetch error: ${err.message}`);
+      console.error("Failed to fetch installed maps", err);
+    }
+  };
+
+  const syncMaps = async (force: boolean = false) => {
+    if (!isConnected && !force) return;
+    setIsFetchingMaps(true);
+    try {
+      await Promise.allSettled([fetchInstalledMaps(), fetchWorkshopMaps()]);
     } finally {
       setIsFetchingMaps(false);
     }
@@ -328,7 +378,7 @@ export default function App() {
 
   useEffect(() => {
     if (isConnected && activeTab === 'maps') {
-      fetchWorkshopMaps();
+      syncMaps();
     }
   }, [isConnected, activeTab]);
 
@@ -361,6 +411,7 @@ export default function App() {
         setShowConfig(false);
         addLog('response', 'Successfully established connection to server ' + sanitized.host);
         fetchStatus();
+        void syncMaps(true);
       } else {
         setConnectionError(data.error || 'Authentication rejected by server.');
         addLog('error', 'Authentication failed: ' + data.error);
@@ -443,12 +494,40 @@ export default function App() {
     return `Custom (${type}:${mode})`;
   };
 
+  const formatMapLabel = (rawName: string) => {
+    return rawName.split(/[_\/]/).map((part: string) => {
+      const lower = part.toLowerCase();
+      if (lower === 'cs2') return 'CS2';
+      if (lower === 'cs') return 'CS';
+      return part.charAt(0).toUpperCase() + part.slice(1).toLowerCase();
+    }).join(' ');
+  };
+
+  const isValidServerMap = (map: any) => {
+    const id = String(map.id || map.name || '').toLowerCase();
+    return /^[a-z0-9_-]+$/.test(id)
+      && !id.includes('/')
+      && !id.includes('vanity')
+      && !/(^editor|^graphics|^lobby|^prefabs|^templates|^ui|^workshop|^server)/.test(id);
+  };
+
+  const defaultMapOptions = serverMaps.length > 0
+    ? serverMaps.filter(isValidServerMap).filter(m => 
+        !workshopMaps.some(wm => 
+          wm.id?.toLowerCase() === (m.id || m.name)?.toLowerCase() || 
+          wm.name?.toLowerCase() === (m.id || m.name)?.toLowerCase()
+        )
+      ).map(m => ({ ...m, type: 'default' as const, name: formatMapLabel(m.name || m.id) }))
+    : MAP_LIST.map(m => ({ ...m, type: 'default' as const }));
+
   const resetConfig = () => {
     localStorage.removeItem('cs2_rcon_config');
     setConfig({ host: '', port: '27015', password: '' });
     setIsConnected(false);
     setConnectionError(null);
     setShowConfig(true);
+    setConfigEdited(false);
+    setHasAutoConnectAttempted(false);
   };
 
   return (
@@ -1375,7 +1454,7 @@ export default function App() {
                 initial={{ opacity: 0, x: -10 }}
                 animate={{ opacity: 1, x: 0 }}
                 exit={{ opacity: 0, x: 10 }}
-                className="flex-1 p-8 flex flex-col"
+                className="flex-1 p-8 flex flex-col min-h-0"
               >
                 <div className="flex items-center justify-between mb-8">
                   <h2 className="text-2xl font-bold tracking-tight">Map List</h2>
@@ -1388,7 +1467,7 @@ export default function App() {
                       Sort: {mapSortOrder === 'name' ? 'Alphabetical' : 'By Source'}
                     </button>
                     <button 
-                      onClick={fetchWorkshopMaps}
+                      onClick={() => void syncMaps()}
                       disabled={isFetchingMaps}
                       className="p-2 bg-cs-bg-panel border border-cs-border hover:bg-white/5 rounded text-cs-muted hover:text-white transition-colors disabled:opacity-50"
                       title="Sync Maps"
@@ -1401,9 +1480,9 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="space-y-2 overflow-y-auto pr-2 custom-scrollbar">
+                <div className="flex-1 min-h-0 space-y-2 overflow-y-auto pr-2 custom-scrollbar">
                   {[
-                    ...MAP_LIST.map(m => ({ ...m, type: 'default' as const })),
+                    ...defaultMapOptions,
                     ...workshopMaps.map(m => ({ 
                       id: m.id.toLowerCase(), 
                       name: m.name.split('_').map((w: string) => {
@@ -1710,7 +1789,10 @@ export default function App() {
                     type="text" 
                     placeholder="E.G. 127.0.0.1"
                     value={config.host}
-                    onChange={(e) => setConfig({ ...config, host: e.target.value })}
+                    onChange={(e) => {
+                      setConfigEdited(true);
+                      setConfig({ ...config, host: e.target.value });
+                    }}
                     className="w-full bg-cs-bg-console border border-cs-border rounded-md py-3 px-4 outline-none focus:border-cs-yellow/50 transition-all font-mono text-sm"
                   />
                 </div>
@@ -1721,7 +1803,10 @@ export default function App() {
                     type="text" 
                     placeholder="27015"
                     value={config.port}
-                    onChange={(e) => setConfig({ ...config, port: e.target.value })}
+                    onChange={(e) => {
+                      setConfigEdited(true);
+                      setConfig({ ...config, port: e.target.value });
+                    }}
                     className="w-full bg-cs-bg-console border border-cs-border rounded-md py-3 px-4 outline-none focus:border-cs-yellow/50 transition-all font-mono text-sm"
                   />
                 </div>
@@ -1732,7 +1817,10 @@ export default function App() {
                     type="password" 
                     placeholder="••••••••"
                     value={config.password}
-                    onChange={(e) => setConfig({ ...config, password: e.target.value })}
+                    onChange={(e) => {
+                      setConfigEdited(true);
+                      setConfig({ ...config, password: e.target.value });
+                    }}
                     className="w-full bg-cs-bg-console border border-cs-border rounded-md py-3 px-4 outline-none focus:border-cs-yellow/50 transition-all font-mono text-sm"
                   />
                 </div>

@@ -232,6 +232,76 @@ async function startServer() {
     return status;
   };
 
+  const parseCs2InstalledMaps = (text: string) => {
+    const lines = text.split("\n");
+    const maps: { id: string; name: string; type: 'default' | 'workshop' }[] = [];
+
+    const normalizeMapToken = (token: string) => token.trim().replace(/\.(bsp|vpk)$/i, "");
+
+    const isValidMapToken = (token: string) => {
+      const cleaned = normalizeMapToken(token);
+      if (!cleaned) return false;
+      if (cleaned.includes('/')) return false;
+
+      const lower = cleaned.toLowerCase();
+      if (!/^[a-z0-9_\-]+$/i.test(cleaned)) return false;
+      if (cleaned.length <= 3) return false;
+      if (lower.includes('vanity')) return false;
+      if (lower.match(/^(map|list|workshop|installed|error|usage|unknown|server|rcon|host|name|status|total)$/i)) return false;
+      if (lower.startsWith('editor') || lower.startsWith('graphics') || lower.startsWith('lobby') || lower.startsWith('prefabs') || lower.startsWith('templates') || lower.startsWith('ui')) return false;
+      return true;
+    };
+
+    const pushMap = (raw: string, friendly?: string) => {
+      const cleaned = normalizeMapToken(raw);
+      if (!isValidMapToken(cleaned)) return;
+      const name = friendly?.trim() || cleaned;
+      if (maps.some(m => m.id.toLowerCase() === cleaned.toLowerCase())) return;
+      maps.push({ id: cleaned, name, type: 'default' });
+    };
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      const listLine = trimmed.match(/^(?:\d+[\.\)]\s*)?(?:map\s+list|installed\s+maps)\s*[:\-]?\s*(.+)$/i);
+      if (listLine && listLine[1]) {
+        listLine[1].split(/\s+/).forEach(token => pushMap(token));
+        continue;
+      }
+
+      const lower = trimmed.toLowerCase();
+      if (lower.includes("workshop") ||
+          lower.includes("rcon from") ||
+          lower.includes("usage") ||
+          lower.includes("error") ||
+          lower.includes("unknown command") ||
+          lower.includes("command not found") ||
+          lower.includes("total") ||
+          lower.includes("server") ||
+          lower.startsWith("l ") ||
+          lower.startsWith("host_") ||
+          lower.startsWith("map ")) {
+        continue;
+      }
+
+      const tokens = trimmed.split(/\s+/);
+      if (tokens.length > 1 && tokens.every(token => isValidMapToken(token))) {
+        tokens.forEach(token => pushMap(token));
+        continue;
+      }
+
+      const match = trimmed.match(/^(?:\d+[\.\)]\s*)?([a-z0-9_\/\-\.]+)(?:\s*[-:]\s*(.+))?$/i);
+      if (!match) continue;
+
+      const rawName = match[1].replace(/\.(bsp|vpk)$/i, "").trim();
+      const friendlyName = match[2] ? match[2].trim() : rawName;
+      pushMap(rawName, friendlyName);
+    }
+
+    return maps;
+  };
+
   const parseCs2WorkshopMaps = (text: string) => {
     const lines = text.split("\n");
     const maps: { name: string; id: string; type: 'workshop' | 'default' }[] = [];
@@ -246,7 +316,7 @@ async function startServer() {
           trimmed.includes("RCON from")) return;
 
       // Pattern 1: [G:1:...] "name" (id)
-      const matchA = trimmed.match(/"([^"]+)"\s+\((\d+)\)/);
+      const matchA = trimmed.match(/"([^\"]+)"\s+\((\d+)\)/);
       if (matchA) {
         maps.push({ name: matchA[1], id: matchA[2], type: 'workshop' });
         return;
@@ -275,6 +345,34 @@ async function startServer() {
 
     return maps;
   };
+
+  app.post("/api/rcon/installed-maps", async (req, res) => {
+    let { host, port, password } = req.body;
+    if (!host || !port || !password) return res.status(400).json({ error: "Missing parameters" });
+    host = host.replace(/^(http|https):\/\//, "").split("/")[0];
+
+    try {
+      const decodedPassword = Buffer.from(password, 'base64').toString('utf-8');
+      const rcon = await Rcon.connect({ host, port: parseInt(port), password: decodedPassword, timeout: 5000 });
+      let response = await rcon.send("maps *");
+      const fallbackResponse = await rcon.send("maps");
+      await rcon.end();
+
+      const shouldFallback = (text: string) => {
+        const lower = String(text || '').toLowerCase();
+        return !lower.trim() || /unknown command|command not found|invalid command|unsupported|not recognized/.test(lower);
+      };
+
+      if (shouldFallback(response) && fallbackResponse && fallbackResponse.trim()) {
+        response = fallbackResponse;
+      }
+
+      const maps = parseCs2InstalledMaps(response);
+      res.json({ success: true, maps, raw: response });
+    } catch (error: any) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
 
   app.post("/api/rcon/workshop-maps", async (req, res) => {
     let { host, port, password } = req.body;
